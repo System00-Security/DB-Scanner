@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
 )
@@ -58,6 +59,7 @@ type SecondaryService struct {
 type Credential struct {
 	Username  string
 	Password  string
+	Database  string
 	Obfuscate bool
 }
 
@@ -76,6 +78,10 @@ type AuthConfig struct {
 	Timeout           time.Duration
 	MaxAttempts       int
 	DelayBetweenTries time.Duration
+	BruteForce        bool
+	WordlistUser      string
+	WordlistPass      string
+	AuthCredential    *Credential
 }
 
 func DefaultAuthConfig() *AuthConfig {
@@ -83,6 +89,10 @@ func DefaultAuthConfig() *AuthConfig {
 		Timeout:           5 * time.Second,
 		MaxAttempts:       10,
 		DelayBetweenTries: 500 * time.Millisecond,
+		BruteForce:        false,
+		WordlistUser:      "",
+		WordlistPass:      "",
+		AuthCredential:    nil,
 	}
 }
 
@@ -100,7 +110,63 @@ func NewAuthChecker(config *AuthConfig) *AuthChecker {
 		credentials: make(map[string][]Credential),
 	}
 	ac.loadDefaultCredentials()
+	if config.BruteForce {
+		ac.loadWordlists()
+	}
 	return ac
+}
+
+func (ac *AuthChecker) loadWordlists() {
+	usernames := []string{}
+	passwords := []string{}
+
+	if ac.config.WordlistUser != "" {
+		data, err := os.ReadFile(ac.config.WordlistUser)
+		if err == nil {
+			lines := strings.Split(string(data), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line != "" && !strings.HasPrefix(line, "#") {
+					usernames = append(usernames, line)
+				}
+			}
+		}
+	}
+
+	if ac.config.WordlistPass != "" {
+		data, err := os.ReadFile(ac.config.WordlistPass)
+		if err == nil {
+			lines := strings.Split(string(data), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line != "" && !strings.HasPrefix(line, "#") {
+					passwords = append(passwords, line)
+				}
+			}
+		}
+	}
+
+	if len(usernames) == 0 {
+		usernames = []string{"root", "admin", "postgres", "sa", "mysql", "mongodb"}
+	}
+	if len(passwords) == 0 {
+		passwords = []string{"", "password", "123456", "admin", "root"}
+	}
+
+	wordlistCreds := make([]Credential, 0, len(usernames)*len(passwords))
+	for _, user := range usernames {
+		for _, pass := range passwords {
+			wordlistCreds = append(wordlistCreds, Credential{
+				Username:  user,
+				Password:  pass,
+				Obfuscate: true,
+			})
+		}
+	}
+
+	for service := range ac.credentials {
+		ac.credentials[service] = append(ac.credentials[service], wordlistCreds...)
+	}
 }
 
 func (ac *AuthChecker) loadDefaultCredentials() {
@@ -186,6 +252,14 @@ func (ac *AuthChecker) CheckAuth(ctx context.Context, host string, port int, ser
 		SecondaryServices: make([]SecondaryService, 0),
 	}
 
+	if ac.config.AuthCredential != nil {
+		result.Metadata["auth_mode"] = "authenticated"
+		result.Metadata["auth_user"] = ac.config.AuthCredential.Username
+		if ac.config.AuthCredential.Database != "" {
+			result.Metadata["auth_db"] = ac.config.AuthCredential.Database
+		}
+	}
+
 	ac.checkSecondaryServices(ctx, host, port, service, result)
 
 	switch strings.ToLower(service) {
@@ -218,9 +292,38 @@ func (ac *AuthChecker) CheckAuth(ctx context.Context, host string, port int, ser
 	return result
 }
 
+func (ac *AuthChecker) GetAuthCredential() *Credential {
+	return ac.config.AuthCredential
+}
+
+func (ac *AuthChecker) HasAuthCredential() bool {
+	return ac.config.AuthCredential != nil
+}
+
 func (ac *AuthChecker) checkMySQLAuth(ctx context.Context, result *AuthResult) {
 	creds := ac.credentials["mysql"]
 	addr := fmt.Sprintf("%s:%d", result.Host, result.Port)
+
+	if ac.config.AuthCredential != nil {
+		authCred := ac.config.AuthCredential
+		result.AttemptsMade++
+		success, privLevel, metadata, _ := tryMySQLConnection(addr, authCred.Username, authCred.Password, authCred.Database, ac.config.Timeout)
+		if success {
+			result.SuccessfulLogin = true
+			result.Credential = &Credential{
+				Username:  authCred.Username,
+				Password:  authCred.Password,
+				Database:  authCred.Database,
+				Obfuscate: true,
+			}
+			result.PrivilegeLevel = privLevel
+			result.Metadata["authenticated_scan"] = "true"
+			for k, v := range metadata {
+				result.Metadata[k] = v
+			}
+			return
+		}
+	}
 
 	for i, cred := range creds {
 		if i >= ac.config.MaxAttempts {
@@ -235,8 +338,9 @@ func (ac *AuthChecker) checkMySQLAuth(ctx context.Context, result *AuthResult) {
 		default:
 		}
 
-		success, privLevel, metadata, err := tryMySQLConnection(addr, cred.Username, cred.Password, ac.config.Timeout)
+		success, privLevel, metadata, err := tryMySQLConnection(addr, cred.Username, cred.Password, cred.Database, ac.config.Timeout)
 		if err != nil {
+			AnalyzeAuthError("mysql", err.Error(), result)
 			if strings.Contains(err.Error(), "Access denied") {
 				result.AuthRequired = true
 				continue
@@ -248,6 +352,7 @@ func (ac *AuthChecker) checkMySQLAuth(ctx context.Context, result *AuthResult) {
 			result.Credential = &Credential{
 				Username:  cred.Username,
 				Password:  cred.Password,
+				Database:  cred.Database,
 				Obfuscate: true,
 			}
 			result.PrivilegeLevel = privLevel
@@ -268,7 +373,10 @@ func (ac *AuthChecker) checkMySQLAuth(ctx context.Context, result *AuthResult) {
 	result.AuthRequired = true
 }
 
-func tryMySQLConnection(addr, username, password string, timeout time.Duration) (bool, string, map[string]string, error) {
+func tryMySQLConnection(addr, username, password, database string, timeout time.Duration) (bool, string, map[string]string, error) {
+	if tryMySQLConnectionFunc != nil {
+		return tryMySQLConnectionFunc(addr, username, password, database, timeout)
+	}
 	metadata := make(map[string]string)
 	return false, "", metadata, fmt.Errorf("mysql driver not available - use go-sql-driver/mysql")
 }

@@ -25,11 +25,16 @@ func init() {
 }
 
 func initMySQLDriver() {
-	tryMySQLConnectionFunc = func(addr, username, password string, timeout time.Duration) (bool, string, map[string]string, error) {
+	tryMySQLConnectionFunc = func(addr, username, password, database string, timeout time.Duration) (bool, string, map[string]string, error) {
 		metadata := make(map[string]string)
 
-		dsn := fmt.Sprintf("%s:%s@tcp(%s)/?timeout=%s&readTimeout=%s",
-			username, password, addr, timeout.String(), timeout.String())
+		dbName := "mysql"
+		if database != "" {
+			dbName = database
+		}
+
+		dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?timeout=%s&readTimeout=%s",
+			username, password, addr, dbName, timeout.String(), timeout.String())
 
 		db, err := sql.Open("mysql", dsn)
 		if err != nil {
@@ -83,7 +88,7 @@ func initMySQLDriver() {
 	}
 }
 
-var tryMySQLConnectionFunc func(addr, username, password string, timeout time.Duration) (bool, string, map[string]string, error)
+var tryMySQLConnectionFunc func(addr, username, password, database string, timeout time.Duration) (bool, string, map[string]string, error)
 
 func initPostgreSQLDriver() {
 	tryPostgreSQLConnectionFunc = func(addr, username, password string, timeout time.Duration) (bool, string, map[string]string, error) {

@@ -35,6 +35,13 @@ type Config struct {
 	SkipAuth        bool
 	SkipConfig      bool
 	Verbose         bool
+	WordlistUser    string
+	WordlistPass    string
+	BruteForce      bool
+	AuthUser        string
+	AuthPass        string
+	AuthDB          string
+	MaxAuthAttempts int
 }
 
 func main() {
@@ -86,6 +93,13 @@ func parseFlags() *Config {
 	flag.BoolVar(&config.SkipConfig, "skip-config", false, "Skip configuration checks")
 	flag.BoolVar(&config.Verbose, "verbose", false, "Verbose output")
 	flag.BoolVar(&config.Verbose, "v", false, "Verbose output (shorthand)")
+	flag.StringVar(&config.WordlistUser, "wordlist-user", "", "Custom username wordlist file for brute force")
+	flag.StringVar(&config.WordlistPass, "wordlist-pass", "", "Custom password wordlist file for brute force")
+	flag.BoolVar(&config.BruteForce, "brute", false, "Enable brute force mode with wordlists")
+	flag.StringVar(&config.AuthUser, "auth-user", "", "Username for authenticated scanning")
+	flag.StringVar(&config.AuthPass, "auth-pass", "", "Password for authenticated scanning")
+	flag.StringVar(&config.AuthDB, "auth-db", "", "Database name for authenticated scanning")
+	flag.IntVar(&config.MaxAuthAttempts, "max-auth-attempts", 10, "Maximum authentication attempts")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Database Exposure Scanner - Non-destructive security assessment tool\n\n")
@@ -96,10 +110,18 @@ func parseFlags() *Config {
 		fmt.Fprintf(os.Stderr, "  %s -t 192.168.1.100\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -t 10.0.0.0/24 -profile thorough\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -iL hosts.txt -p 3306,5432,27017 -o report.json -format json\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -t 192.168.1.100 -auth-user admin -auth-pass secret -auth-db mydb\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -t 192.168.1.100 -brute -wordlist-user users.txt -wordlist-pass pass.txt\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nProfiles:\n")
 		fmt.Fprintf(os.Stderr, "  fast      - Quick scan with minimal ports and checks\n")
 		fmt.Fprintf(os.Stderr, "  default   - Standard scan with common DB ports\n")
 		fmt.Fprintf(os.Stderr, "  thorough  - Full scan with all ports and deep checks\n")
+		fmt.Fprintf(os.Stderr, "\nAuthenticated Scanning:\n")
+		fmt.Fprintf(os.Stderr, "  Use -auth-user and -auth-pass to perform deep configuration checks\n")
+		fmt.Fprintf(os.Stderr, "  with valid credentials. This enables more thorough security analysis.\n")
+		fmt.Fprintf(os.Stderr, "\nBrute Force Mode:\n")
+		fmt.Fprintf(os.Stderr, "  Use -brute with -wordlist-user and -wordlist-pass for custom wordlists.\n")
+		fmt.Fprintf(os.Stderr, "  WARNING: Only use on systems you have permission to test.\n")
 	}
 
 	flag.Parse()
@@ -125,6 +147,26 @@ func validateConfig(config *Config) error {
 
 	if config.MaxConcurrency < 1 {
 		return fmt.Errorf("concurrency must be at least 1")
+	}
+
+	if config.BruteForce {
+		if config.WordlistUser == "" && config.WordlistPass == "" {
+			return fmt.Errorf("brute force mode requires at least one wordlist (-wordlist-user or -wordlist-pass)")
+		}
+		if config.WordlistUser != "" {
+			if _, err := os.Stat(config.WordlistUser); os.IsNotExist(err) {
+				return fmt.Errorf("username wordlist file not found: %s", config.WordlistUser)
+			}
+		}
+		if config.WordlistPass != "" {
+			if _, err := os.Stat(config.WordlistPass); os.IsNotExist(err) {
+				return fmt.Errorf("password wordlist file not found: %s", config.WordlistPass)
+			}
+		}
+	}
+
+	if config.MaxAuthAttempts < 1 {
+		return fmt.Errorf("max-auth-attempts must be at least 1")
 	}
 
 	return nil
@@ -223,7 +265,24 @@ func run(ctx context.Context, config *Config) error {
 	}
 
 	fp := fingerprint.NewFingerprinter(config.Timeout)
-	authChecker := auth.NewAuthChecker(auth.DefaultAuthConfig())
+
+	authConfig := &auth.AuthConfig{
+		Timeout:           config.Timeout,
+		MaxAttempts:       config.MaxAuthAttempts,
+		DelayBetweenTries: 500 * time.Millisecond,
+		BruteForce:        config.BruteForce,
+		WordlistUser:      config.WordlistUser,
+		WordlistPass:      config.WordlistPass,
+		AuthCredential:    nil,
+	}
+	if config.AuthUser != "" {
+		authConfig.AuthCredential = &auth.Credential{
+			Username: config.AuthUser,
+			Password: config.AuthPass,
+			Database: config.AuthDB,
+		}
+	}
+	authChecker := auth.NewAuthChecker(authConfig)
 	configChecker := configcheck.NewConfigChecker(config.Timeout)
 
 	reportBuilder := report.NewReportBuilder()
